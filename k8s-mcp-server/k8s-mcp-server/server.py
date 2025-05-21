@@ -1,94 +1,82 @@
-from kubernetes import client, config
+import os
+import subprocess
+from groq import Groq
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from kubernetes.client import api_client
+from kubernetes import client, config, dynamic
 
+load_dotenv()
 
 mcp = FastMCP("k8s-mcp-server")
 
+groq_client = Groq(
+    api_key=os.getenv("GROQ_API_KEY")
+)
 
-@mcp.tool()
-def list_pod():
-    """
-    This tool returns all the pods across all the namespaces in the kubernetes cluster.
-
-    Returns:
-        String containing pod details including pod ip, pod namespace and pod name.
-    """
-    config.load_kube_config(config_file="/home/devjpt23/.kube/config")
-    v1 = client.CoreV1Api()
-    print("Listing pods with their IPs:")
-    ret = v1.list_pod_for_all_namespaces(watch=False)
-    pods_det = []
-    for i in ret.items:
-        pods_det.append(
-            "%s\t%s\t%s" % (i.status.pod_ip, i.metadata.namespace, i.metadata.name)
-        )
-    return pods_det
+def execute_command(command):
+    process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    stdout, stderr = process.communicate()
+    return_code = process.returncode
+    return stdout.decode(), stderr.decode(), return_code
 
 
-def create_deployment_object(image: str, port: int, deployment_name: str, replicas:int):
-
-    container = client.V1Container(
-        name=deployment_name,
-        image=image,
-        ports=[client.V1ContainerPort(container_port=port)],
-        resources=client.V1ResourceRequirements(
-            requests={"cpu": "100m", "memory": "200Mi"},
-            limits={"cpu": "500m", "memory": "500Mi"},
-        ),
+def talk_llm(question_llm: str) -> str:
+    chat_completion = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a professional Kubernetes engineer. An expert at analysis Kubernetes resources and creating resources. During generation of Kubernetes resources, make sure to only generate the yaml file and nothing else. During analysis make sure that user's request has been fulfilled.",
+            },
+            {"role": "user", "content": question_llm},
+        ],
     )
 
-    template = client.V1PodTemplateSpec(
-        metadata=client.V1ObjectMeta(labels={"app": deployment_name}),
-        spec=client.V1PodSpec(containers=[container]),
-    )
-
-    spec = client.V1DeploymentSpec(
-        replicas, template=template, selector={"matchLabels": {"app": deployment_name}}
-    )
-
-    deployment = client.V1Deployment(
-        api_version="apps/v1",
-        kind="Deployment",
-        metadata=client.V1ObjectMeta(name=deployment_name),
-        spec=spec,
-    )
-
-    return deployment
+    return str(chat_completion.choices[0].message.content)
 
 
-def obj_to_deploy(api, deployment):
-    api.create_namespaced_deployment(body=deployment, namespace="default")
-
-
-@mcp.tool()
-def create_deployment(image: str, port: int, deployment_name: str, replicas: int):
-    """
-    This tool creates deployment object on kubernetes cluster
-
-    Args:
-        image: name of the image that will run in the container
-        port: port that is going to be exposed
-        deployment_name: name of the deployment
-        replicas: the amount of pods that should be backed by this deployment
-
-        Example:
-        create_deployment{
-            "image":"nginx:latest",
-            "port":80,
-            "deployment_name":"devs-deployment",
-            "replicas":3
-        }
-    Returns:
-        A string message confirming that the deployment has been created successfully.
-    """
-    config.load_kube_config(config_file="/home/devjpt23/.kube/config")
-    apps_v1 = client.AppsV1Api()
-
-    deployment = create_deployment_object(image, port, deployment_name, replicas)
-    obj_to_deploy(apps_v1, deployment)
-    return f"{deployment_name} has been deployed sucessfully"
+def create_file(filename: str, content: str):
+    with open(filename, "w") as file:
+        file.write(content)
     
 
+@mcp.tool()
+def create_k8s_resource(user_input: str):
+
+    """
+    This tool is responsible for creating any Kubernetes resource.
+
+    Args:
+        user_input: this includes the user's request to create a Kubernetes resource
+        For example:
+            'Can you create a deployment resource with following configurations:
+                deployment-name: devs-deployment
+                container-port: 80
+                image: nginx:latest
+                app-selector: devs-app'
+    
+    Returns:
+        A string message indicating the result of the request: success confirmation with output, or failure with error details.
+    """
+    k8s_resource = talk_llm(user_input)
+
+    # Confirm k8s_resource creation
+    confirmation = talk_llm(
+        f"""
+        "Here is a user's request: {user_input}. And here is the YAML that was generated: {k8s_resource}.
+        Please check if the YAML fully satisfies the request. If it does, return only the YAML file without any extra explanation and only YAML content with out ```yml at the start and ``` at the end.
+        If not, update the YAML to fulfill the request."
+
+        """
+    )
+    create_file("k8s-resources.yaml",f"{str(confirmation)}")
+    output, err, return_code = execute_command(f"kubectl create -f k8s-resources.yaml")
+
+    if return_code != 0:
+        return f"Resource Creation Failed due to {err}"
+    else:
+        return f"Resource has been created successfully. {output}"
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
