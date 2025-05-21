@@ -9,4 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
+# Ignore environment variable and Kubernetes resource files
 .env
+k8s-resources.yaml
+
+
