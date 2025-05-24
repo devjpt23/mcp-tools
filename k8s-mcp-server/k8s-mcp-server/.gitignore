@@ -13,4 +13,10 @@ wheels/
 .env
 k8s-resources.yaml
 
+# Ignore all files in the resources directory
+resources/*
+
+
+
+
 
