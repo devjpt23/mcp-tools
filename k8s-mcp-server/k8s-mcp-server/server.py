@@ -1,50 +1,85 @@
-import os
-import subprocess
-from groq import Groq
-from dotenv import load_dotenv
+import json
+import yaml
 from mcp.server.fastmcp import FastMCP
-from kubernetes.client import api_client
-from kubernetes import client, config, dynamic
+from kubernetes import client, config
+from kubernetes.dynamic import DynamicClient
+from kubernetes.client import ApiClient
+from kubernetes.dynamic.exceptions import ConflictError, DynamicApiError
 
-load_dotenv()
 
 mcp = FastMCP("k8s-mcp-server")
 
-groq_client = Groq(
-    api_key=os.getenv("GROQ_API_KEY")
-)
+
+def get_schema_raw_and_definition(resource_kind: str):
+    config.load_kube_config(config_file="/home/devjpt23/.kube/config")
+    api_client = client.ApiClient()
+
+    response = api_client.call_api(
+        "/openapi/v2",
+        "GET",
+        response_type="str",
+        auth_settings=["BearerToken"],
+        _preload_content=False,
+    )
+
+    schema_raw = json.loads(response[0].data)
+
+    definition_key = None
+
+    for key in schema_raw["definitions"].keys():
+        if key.endswith(resource_kind):
+            print(key)
+            definition_key = key
+            break
+
+    definition = schema_raw["definitions"][definition_key]
+    description = definition["description"]
+    return (definition, schema_raw["definitions"], description)
+
+
+def explain_fields(schema, definitions, indent=0):
+    properties = schema.get("properties", {})
+    lines = []
+    for name, fields in properties.items():
+        lines.append(" " * indent + f"{name}: {fields.get('type','object')}")
+        ref = fields.get("$ref")
+        if ref:
+            ref_key = ref.split("/")[-1]
+            lines.append(explain_fields(definitions[ref_key], definitions, indent + 2))
+        elif fields.get("type") == "array" and "items" in fields:
+            item_ref = fields["items"].get("$ref")
+            if item_ref:
+                ref_key = item_ref.split("/")[-1]
+                lines.append(
+                    explain_fields(definitions[ref_key], definitions, indent + 2)
+                )
+    return "\n".join(lines)
+
 
 @mcp.tool()
-def get_resource_template(resource: str):
+def get_resource_template(resource_kind: str):
     """
-    Retrieve the YAML template structure for a specified Kubernetes resource using 'kubectl explain --recursive'.
+    Generate a detailed explanation of a Kubernetes resource, including its description and schema fields.
 
-    Parameters:
-        resource (str): The name of the Kubernetes resource to explain (e.g., 'deployment', 'service', 'pod').
+    Args:
+        resource_kind (str): The kind of Kubernetes resource to explain (e.g., 'Pod', 'Deployment').
+
+        NOTE: THE RESOURCE KIND STRING MUST BE IN CAMEL CASE FOR EXAMPLE: ClusterRoleBinding and not clusterrolebinding.
 
     Returns:
-        str: The detailed structure and fields of the resource, as provided by 'kubectl explain --recursive'.
-
-    Example:
-        Input:
-            can you create a template for a pod with name mypod with image myimage
-        Output:
-            apiVersion: v1
-            kind: Pod
-            metadata:
-              name: mypod
-            spec:
-              containers:
-              - name: mycontainer
-                image: myimage
-            ...
-
-        Note:
-        Do not save the yaml file into yaml file, just display the content.
+        str: A formatted string containing the resource description and schema fields.
     """
-    cmd = ["kubectl", "explain", resource, "--recursive"]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
-    return result.stdout
+    definition, definitions, description = get_schema_raw_and_definition(resource_kind)
+    fields_explanation = explain_fields(definition, definitions)
+
+    return f"""
+    DESCRIPTION:
+        {description}
+        
+    FIELDS:
+        {fields_explanation}
+"""
+
 
 @mcp.tool()
 def save_yaml(response: str, filename: str = "resource.yaml"):
@@ -74,23 +109,50 @@ def save_yaml(response: str, filename: str = "resource.yaml"):
     """
     with open(f"resources/{filename}", "w") as f:
         f.write(response)
-    
-    return f'File {filename} has been created with the resource!'
+
+    return f"File {filename} has been created with the resource!"
+
+
+def parse_yaml(filename: str):
+    kind = ""
+    apiVersion = ""
+    with open(f"resources/{filename}") as stream:
+        try:
+            data = yaml.safe_load(stream)
+            for key, value in data.items():
+                if key == "kind":
+                    kind += value
+
+                if key == "apiVersion":
+                    apiVersion += value
+
+        except yaml.YAMLError as exc:
+            print(exc)
+
+    return kind, apiVersion, data
+
 
 @mcp.tool()
-def execute_yaml(filename):
-    """
-    Apply a Kubernetes resource YAML file using 'kubectl create -f'.
+def execute_yaml(filename: str, namespace: str) -> str:
 
-    Parameters:
-        filename (str): The name of the YAML file (located in the 'resources' directory) to be applied to the Kubernetes cluster.
+    config.load_kube_config(config_file="/home/devjpt23/.kube/config")
+    api_client = ApiClient()
+    dyn_client = DynamicClient(api_client)
 
-    Returns:
-        str: The output from the 'kubectl create' command, indicating the result of the resource creation.
-    """
-    cmd = ["kubectl", "create","-f", f"resources/{filename}"]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
-    return result.stdout
+    kind, apiVersion, manifest = parse_yaml(filename)
+    resource = dyn_client.resources.get(
+        api_version=apiVersion,
+        kind=kind,
+    )
+
+    try:
+        resource.create(body=manifest, namespace=namespace)
+        return f"{kind} has been created!"
+    except ConflictError as e:
+        return f"Failed to create resource, resource already exists.{e.body}"
+    except DynamicApiError as e:
+        return f"Failed to create resource: {e.body}"
+
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
